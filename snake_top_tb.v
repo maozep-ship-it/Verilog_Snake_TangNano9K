@@ -1,7 +1,16 @@
 // Testbench - Snake Game (Tang Nano 9K + Sipeed 7-inch LCD 800x480)
 //
-// Phase 1 - ST_IDLE:    white title text visible, no green/red game pixels
-// Phase 2 - ST_PLAYING: after key press -> green head, red food, white score
+// Phase 1 - ST_IDLE:       white title text, no green pixels
+// Phase 2 - ST_PLAYING:    head green, food red, score white, no bad pixels
+// Phase 3 - Movement:      head position changes after one forced game move
+// Phase 4 - U-turn block:  pressing opposite direction does not reverse snake
+// Phase 5 - Game Over:     hit_body=1 -> transitions to ST_GAME_OVER
+// Phase 6 - GO visuals:    red/dark-red background + GAME OVER text, no green
+// Phase 7 - Reset:         S1 returns to ST_IDLE, title visible
+//
+// Acceleration technique (Phases 3, 4):
+//   Instead of waiting 15 frames for a game move, force dut.frame_cnt = 14
+//   immediately before a frame_tick.  The move fires on that same tick.
 //
 // Build & run:
 //   iverilog -g2005 -o snake_sim.vvp clock_divider.v vga_controller.v \
@@ -31,32 +40,44 @@ module snake_top_tb;
 
     always #18.5 clk = ~clk;
 
-    integer vsync_count  = 0;
-    integer hsync_count  = 0;
-    integer white_pixels = 0;
-    integer green_pixels = 0;
-    integer red_pixels   = 0;
-    integer bad_pixels   = 0;
+    integer vsync_count   = 0;
+    integer white_pixels  = 0;
+    integer green_pixels  = 0;
+    integer red_pixels    = 0;   // bright red: R=11111 G=0 B=0
+    integer anyred_pixels = 0;   // any red-only: R>0 G=0 B=0  (covers dark flash too)
+    integer bad_pixels    = 0;
 
-    always @(negedge LCD_HYNC) hsync_count = hsync_count + 1;
     always @(negedge LCD_SYNC) vsync_count = vsync_count + 1;
 
     always @(posedge LCD_CLK) begin
         if (LCD_DEN && LCD_R==5'b11111 && LCD_G==6'b111111 && LCD_B==5'b11111)
-            white_pixels = white_pixels + 1;
+            white_pixels  = white_pixels  + 1;
         if (LCD_DEN && LCD_R==5'b00000 && LCD_G==6'b111111 && LCD_B==5'b00000)
-            green_pixels = green_pixels + 1;
+            green_pixels  = green_pixels  + 1;
         if (LCD_DEN && LCD_R==5'b11111 && LCD_G==6'b000000 && LCD_B==5'b00000)
-            red_pixels   = red_pixels + 1;
+            red_pixels    = red_pixels    + 1;
+        if (LCD_DEN && LCD_G==6'b000000 && LCD_B==5'b00000 && LCD_R!=5'b0)
+            anyred_pixels = anyred_pixels + 1;
         if (!LCD_DEN && (LCD_R!=5'b0 || LCD_G!=6'b0 || LCD_B!=5'b0))
-            bad_pixels   = bad_pixels + 1;
+            bad_pixels    = bad_pixels    + 1;
     end
 
     task reset_counters;
         begin
-            white_pixels = 0; green_pixels = 0;
-            red_pixels   = 0; vsync_count  = 0;
-            hsync_count  = 0;
+            white_pixels  = 0; green_pixels  = 0;
+            red_pixels    = 0; anyred_pixels = 0;
+            vsync_count   = 0; bad_pixels    = 0;
+        end
+    endtask
+
+    // Force a game move immediately by setting frame_cnt to move_speed-1
+    // right before the next frame_tick.
+    task force_one_move;
+        begin
+            force dut.frame_cnt = 4'd14;   // move_speed-1 at score 0
+            @(posedge dut.frame_tick);
+            #60;                           // 2 clk_pixel periods - let NBA settle
+            release dut.frame_cnt;
         end
     endtask
 
@@ -102,10 +123,10 @@ module snake_top_tb;
 
         // ---- Phase 2: press UP key -> ST_PLAYING ----
         // Must hold for at least one full frame so frame_tick sees any_key=1
-        KEY_COL = 4'b0010;           // COL1=1 -> key "2" (UP)
+        KEY_COL = 4'b0010;            // COL1=1 -> key "2" (UP)
         #(ONE_FRAME + ONE_FRAME / 2); // hold 1.5 frames to guarantee frame_tick sees it
         KEY_COL = 4'b0000;
-        reset_counters;              // start counting only after key released
+        reset_counters;               // start counting only after key released
         #(2 * ONE_FRAME);
 
         $display("--- Phase 2: ST_PLAYING ---");
@@ -133,6 +154,127 @@ module snake_top_tb;
             $display("PASS: No pixels outside DE");
         else
             $display("FAIL: %0d pixels outside DE", bad_pixels);
+
+        // ---- Phase 3: Snake movement ----
+        // Force frame_cnt -> move fires on next frame_tick (no 15-frame wait).
+        // Snake is going UP: head_row must decrease by 1.
+        $display("--- Phase 3: Snake movement ---");
+        begin : phase3
+            reg [4:0] pre_col;
+            reg [3:0] pre_row;
+            pre_col = dut.head_col;
+            pre_row = dut.head_row;
+            $display("Pre-move  head: col=%0d row=%0d", pre_col, pre_row);
+            force_one_move;
+            $display("Post-move head: col=%0d row=%0d", dut.head_col, dut.head_row);
+            if (dut.head_row < pre_row || (pre_row == 4'd0 && dut.head_row == 4'd14))
+                $display("PASS: Snake moved UP");
+            else
+                $display("FAIL: Snake did not move UP (row %0d -> %0d)", pre_row, dut.head_row);
+            // Count one clean frame to verify pixel output after the move
+            reset_counters;
+            #(ONE_FRAME);
+            if (green_pixels >= 800 && green_pixels <= 1000)
+                $display("PASS: Head pixels OK after move");
+            else
+                $display("FAIL: Head pixels wrong after move - got %0d", green_pixels);
+        end
+
+        // ---- Phase 4: U-turn prevention ----
+        // Direction is UP. Force key_down=1 (opposite) for one frame, then
+        // trigger a move and verify the row still decreased (snake kept going UP).
+        $display("--- Phase 4: U-turn prevention ---");
+        begin : phase4
+            reg [3:0] pre_row4;
+            pre_row4 = dut.head_row;
+            // Override keypad_scanner outputs to simulate pressing DOWN
+            force dut.key_down = 1'b1;
+            force dut.key_up   = 1'b0;
+            @(posedge dut.frame_tick);  // let one frame_tick see key_down
+            #1;
+            release dut.key_down;
+            release dut.key_up;
+            // Now trigger a move
+            force_one_move;
+            $display("Post-Uturn head: col=%0d row=%0d", dut.head_col, dut.head_row);
+            if (dut.head_row < pre_row4 || (pre_row4 == 4'd0 && dut.head_row == 4'd14))
+                $display("PASS: U-turn blocked, snake still moving UP");
+            else
+                $display("FAIL: U-turn NOT blocked (row %0d -> %0d)", pre_row4, dut.head_row);
+        end
+
+        // ---- Phase 5: Self-collision -> Game Over ----
+        // hit_body is only evaluated when frame_tick AND frame_cnt==move_speed-1.
+        // Force both so the collision check fires on the very next frame_tick.
+        $display("--- Phase 5: Self-collision -> Game Over ---");
+        force dut.hit_body  = 1'b1;
+        force dut.frame_cnt = 4'd14;
+        @(posedge dut.frame_tick);
+        #60;
+        release dut.hit_body;
+        release dut.frame_cnt;
+        #100;
+        if (dut.game_state == 2'd2)
+            $display("PASS: Transitioned to ST_GAME_OVER");
+        else
+            $display("FAIL: game_state=%0d (expected 2=ST_GAME_OVER)", dut.game_state);
+
+        // ---- Phase 6: Game Over visuals ----
+        // anyred_pixels covers both flash states (bright R=11111 and dark R=00110).
+        // Expect: anyred > 0, GAME OVER text (white > 0), no green, no bad pixels.
+        reset_counters;
+        #(2 * ONE_FRAME);
+        $display("--- Phase 6: Game Over visuals ---");
+        $display("AnyRed : %0d (expect >0 flash bg)", anyred_pixels);
+        $display("White  : %0d (expect >0 GAME OVER text)", white_pixels);
+        $display("Green  : %0d (expect 0)", green_pixels);
+        $display("Bad    : %0d (expect 0)", bad_pixels);
+
+        if (anyred_pixels > 0)
+            $display("PASS: Red flash background visible");
+        else
+            $display("FAIL: No red background in Game Over");
+
+        if (white_pixels > 0)
+            $display("PASS: GAME OVER text visible");
+        else
+            $display("FAIL: No GAME OVER text pixels");
+
+        if (green_pixels == 0)
+            $display("PASS: No snake pixels in Game Over");
+        else
+            $display("FAIL: Unexpected green in Game Over: %0d", green_pixels);
+
+        if (bad_pixels == 0)
+            $display("PASS: No pixels outside DE in Game Over");
+        else
+            $display("FAIL: %0d pixels outside DE in Game Over", bad_pixels);
+
+        // ---- Phase 7: Reset from Game Over -> ST_IDLE ----
+        $display("--- Phase 7: Reset from Game Over ---");
+        reset_btn = 1'b0;  // S1 active-low: assert reset
+        #200;
+        reset_btn = 1'b1;
+        reset_counters;
+        #(2 * ONE_FRAME);
+        $display("State  : %0d (expect 0=ST_IDLE)", dut.game_state);
+        $display("White  : %0d (expect >0 title screen)", white_pixels);
+        $display("Green  : %0d (expect 0)", green_pixels);
+
+        if (dut.game_state == 2'd0)
+            $display("PASS: Back to ST_IDLE after reset");
+        else
+            $display("FAIL: game_state=%0d (expected 0=ST_IDLE)", dut.game_state);
+
+        if (white_pixels > 0)
+            $display("PASS: Title screen visible after reset");
+        else
+            $display("FAIL: No title text after reset");
+
+        if (green_pixels == 0)
+            $display("PASS: No game pixels after reset");
+        else
+            $display("FAIL: Unexpected green after reset: %0d", green_pixels);
 
         $display("=== Done ===");
         $finish;
